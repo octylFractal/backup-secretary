@@ -19,12 +19,17 @@ import org.gradle.kotlin.dsl.property
 import org.gradle.kotlin.dsl.provideDelegate
 import org.gradle.kotlin.dsl.setProperty
 import org.gradle.kotlin.dsl.setValue
+import org.gradle.kotlin.dsl.submit
+import org.gradle.workers.WorkerExecutor
 import java.io.File
+import javax.inject.Inject
 
 /**
  * Compiles `.capnp` files to a target language.
  */
-open class CapnProtoCompile : DefaultTask() {
+open class CapnProtoCompile @Inject constructor(
+    private val workerExecutor: WorkerExecutor
+) : DefaultTask() {
 
     @InputDirectory
     val compilerLibrariesProperty = project.objects.directoryProperty()
@@ -37,10 +42,14 @@ open class CapnProtoCompile : DefaultTask() {
      * Directories to pass to `capnp` as `-I` include directories.
      */
     @InputFiles
-    val includes = project.objects.setProperty<Directory>()
+    val includesProperty = project.objects.setProperty<Directory>()
         .convention(project.layout.capnprotoExecutables.map {
             setOf(it.dir("include"))
         })
+
+    @get:Internal
+    val includes: MutableSet<Directory>
+        get() = includesProperty.get()
 
     @InputFile
     val compilerExecutableProperty = project.objects.fileProperty()
@@ -73,29 +82,28 @@ open class CapnProtoCompile : DefaultTask() {
 
     @TaskAction
     fun compile() {
+        val workQueue = workerExecutor.noIsolation()
         for (tree in sourceFiles.srcDirTrees) {
-            project.exec {
-                environment("LD_LIBRARY_PATH", compilerLibraries.asFile.absolutePath)
-                environment("PWD", workingDir)
-                executable(compilerExecutable)
-                args("compile")
-                // Find the common root for the sources
-                args("--src-prefix=${tree.dir.absolutePath}")
-                // Don't let the system affect us
-                args("--no-standard-import")
-                // Instead, use -Is from the jars/etc.
-                args(includes.get().map { "-I${it.asFile.absolutePath}" })
-                // Resolve our language executables
-                val lang = language
-                val langPath: File = when {
-                    "/" in lang -> project.file(lang)
-                    else -> project.layout.capnprotoExecutables
-                        .map { it.file("bin/capnpc-$language") }
-                        .get()
-                        .asFile
+            for (file in project.fileTree(tree.dir).matching(tree.patterns).files) {
+                workQueue.submit(CapnProtoCompileWorker::class) {
+                    compilerLibraryPath.set(compilerLibrariesProperty)
+                    compilerExecutable.set(compilerExecutableProperty)
+
+                    sourceFile.set(file)
+                    sourcePrefix.set(tree.dir)
+                    includes.set(includesProperty)
+
+                    val lang = language
+                    val langPath: File = when {
+                        "/" in lang -> project.file(lang)
+                        else -> project.layout.capnprotoExecutables
+                            .map { it.file("bin/capnpc-$language") }
+                            .get()
+                            .asFile
+                    }
+                    languagePath.set(langPath)
+                    outputDirectory.set(outputDirectoryProperty)
                 }
-                args("-o${langPath.absolutePath}:${outputDirectory.asFile.absolutePath}")
-                args(project.fileTree(tree.dir).matching(tree.patterns).files.map { it.absolutePath })
             }
         }
     }
